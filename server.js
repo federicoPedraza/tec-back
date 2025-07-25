@@ -2,9 +2,13 @@ const express = require('express');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
 require('dotenv').config();
+const { ConvexHttpClient } = require("convex/browser");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Initialize Convex client
+const convex = new ConvexHttpClient(process.env.CONVEX_URL || "https://your-convex-deployment.convex.cloud");
 
 // Create nodemailer transporter
 const transporter = nodemailer.createTransport({
@@ -22,6 +26,44 @@ app.use(express.json());
 // Health check endpoint
 app.get('/', (req, res) => {
   res.json({ message: 'Server is running!' });
+});
+
+// Get all contacts endpoint
+app.get('/contacts', async (req, res) => {
+  try {
+    const contacts = await convex.query("contacts:getAllContacts");
+    res.json({ contacts });
+  } catch (error) {
+    console.error('Error fetching contacts:', error);
+    res.status(500).json({ error: 'Error fetching contacts', details: error.message });
+  }
+});
+
+// Get all requests endpoint
+app.get('/requests', async (req, res) => {
+  try {
+    const requests = await convex.query("requests:getAllRequests");
+    res.json({ requests });
+  } catch (error) {
+    console.error('Error fetching requests:', error);
+    res.status(500).json({ error: 'Error fetching requests', details: error.message });
+  }
+});
+
+// Get requests by status endpoint
+app.get('/requests/status/:status', async (req, res) => {
+  try {
+    const { status } = req.params;
+    if (status !== 'pending' && status !== 'processed') {
+      return res.status(400).json({ error: 'Status must be either "pending" or "processed"' });
+    }
+
+    const requests = await convex.query("requests:getRequestsByStatus", { status });
+    res.json({ requests });
+  } catch (error) {
+    console.error('Error fetching requests by status:', error);
+    res.status(500).json({ error: 'Error fetching requests by status', details: error.message });
+  }
 });
 
 // Onboarding endpoint
@@ -43,8 +85,23 @@ app.post('/onboarding', async (req, res) => {
 
     // Validate required fields
     if (!name || !email) {
-      return res.status(400).json({ error: 'Nombre y email son requeridos' });
+      return res.status(400).json({ success: false });
     }
+
+    // Save to Convex database
+    const { contactId, requestId } = await convex.mutation("requests:addOnboarding", {
+      name,
+      email,
+      phone,
+      objective,
+      experience,
+      experienceLevel,
+      speakingExperience,
+      listeningExperience,
+      readingExperience,
+      writingExperience,
+      comment
+    });
 
     // Email para el administrador/empresa
     const adminMailOptions = {
@@ -158,20 +215,11 @@ app.post('/onboarding', async (req, res) => {
       user: userResult.messageId
     });
 
-    res.json({
-      message: 'Emails de onboarding enviados exitosamente!',
-      data: {
-        adminMessageId: adminResult.messageId,
-        userMessageId: userResult.messageId
-      }
-    });
+    res.json({ success: true });
 
   } catch (error) {
     console.error('Email error:', error);
-    res.status(500).json({
-      error: 'Error enviando emails',
-      details: error.message
-    });
+    res.status(500).json({ success: false });
   }
 });
 
@@ -186,8 +234,15 @@ app.post('/interview', async (req, res) => {
 
     // Validate required fields
     if (!name || (!email && !phone)) {
-      return res.status(400).json({ error: 'Nombre y al menos un método de contacto (email o teléfono) son requeridos' });
+      return res.status(400).json({ success: false });
     }
+
+    // Save to Convex database
+    const { contactId, requestId } = await convex.mutation("requests:addInterview", {
+      name,
+      email,
+      phone
+    });
 
     // Email para el administrador/empresa
     const adminMailOptions = {
@@ -286,20 +341,91 @@ app.post('/interview', async (req, res) => {
       user: userResult?.messageId || 'No user email provided'
     });
 
-    res.json({
-      message: 'Solicitud de entrevista enviada exitosamente!',
-      data: {
-        adminMessageId: adminResult.messageId,
-        userMessageId: userResult?.messageId || null
-      }
-    });
+    res.json({ success: true });
 
   } catch (error) {
     console.error('Interview email error:', error);
-    res.status(500).json({
-      error: 'Error enviando solicitud de entrevista',
-      details: error.message
+    res.status(500).json({ success: false });
+  }
+});
+
+// Newsletter subscribe endpoint
+app.post('/newsletter/subscribe', async (req, res) => {
+  try {
+    const { name, email } = req.body;
+
+    // Validate required fields
+    if (!name || !email) {
+      return res.status(400).json({ success: false });
+    }
+
+    // Subscribe to newsletter
+    await convex.mutation("newsletter:subscribe", {
+      name,
+      email
     });
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error subscribing to newsletter:', error);
+    res.status(500).json({ success: false });
+  }
+});
+
+// Newsletter unsubscribe endpoint
+app.post('/newsletter/unsubscribe', async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    // Validate required fields
+    if (!email) {
+      return res.status(400).json({ success: false });
+    }
+
+    // Unsubscribe from newsletter
+    await convex.mutation("newsletter:unsubscribe", {
+      email
+    });
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error unsubscribing from newsletter:', error);
+    res.status(500).json({ success: false });
+  }
+});
+
+// Get newsletter subscription status endpoint
+app.get('/newsletter/subscription/:email', async (req, res) => {
+  try {
+    const { email } = req.params;
+
+    // Get subscription status
+    const subscription = await convex.query("newsletter:getSubscription", {
+      email
+    });
+
+    if (!subscription) {
+      return res.json({ subscribed: false, message: 'No subscription found for this email' });
+    }
+
+    res.json({
+      subscribed: subscription.active,
+      subscription
+    });
+  } catch (error) {
+    console.error('Error getting subscription status:', error);
+    res.status(500).json({ error: 'Error getting subscription status', details: error.message });
+  }
+});
+
+// Get all active newsletter subscriptions endpoint
+app.get('/newsletter/subscribers', async (req, res) => {
+  try {
+    const subscribers = await convex.query("newsletter:getAllActiveSubscriptions");
+    res.json({ subscribers });
+  } catch (error) {
+    console.error('Error fetching newsletter subscribers:', error);
+    res.status(500).json({ error: 'Error fetching newsletter subscribers', details: error.message });
   }
 });
 
@@ -309,4 +435,11 @@ app.listen(PORT, () => {
   console.log(`Health check: http://localhost:${PORT}`);
   console.log(`Onboarding endpoint: POST http://localhost:${PORT}/onboarding`);
   console.log(`Interview endpoint: POST http://localhost:${PORT}/interview`);
+  console.log(`Newsletter subscribe: POST http://localhost:${PORT}/newsletter/subscribe`);
+  console.log(`Newsletter unsubscribe: POST http://localhost:${PORT}/newsletter/unsubscribe`);
+  console.log(`Newsletter status: GET http://localhost:${PORT}/newsletter/subscription/{email}`);
+  console.log(`Newsletter subscribers: GET http://localhost:${PORT}/newsletter/subscribers`);
+  console.log(`Contacts endpoint: GET http://localhost:${PORT}/contacts`);
+  console.log(`Requests endpoint: GET http://localhost:${PORT}/requests`);
+  console.log(`Requests by status: GET http://localhost:${PORT}/requests/status/{pending|processed}`);
 });
