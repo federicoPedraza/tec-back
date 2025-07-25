@@ -20,7 +20,13 @@ const transporter = nodemailer.createTransport({
 });
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: [
+    'https://the-english-crab-app-git-main-federico-pedrazas-projects.vercel.app',
+    'http://localhost:5173'
+  ],
+  credentials: true
+}));
 app.use(express.json());
 
 // Health check endpoint
