@@ -1,14 +1,23 @@
 const express = require('express');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
+const crypto = require('crypto');
 require('dotenv').config();
 const { ConvexHttpClient } = require("convex/browser");
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Initialize Convex client
 const convex = new ConvexHttpClient(process.env.CONVEX_URL || "https://your-convex-deployment.convex.cloud");
+
+// Supabase client (service role for server-side operations)
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE || process.env.SUPABASE_KEY;
+const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE)
+  : null;
 
 // Create nodemailer transporter
 const transporter = nodemailer.createTransport({
@@ -28,15 +37,217 @@ app.use(cors({
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
   optionsSuccessStatus: 200
 }));
-app.use(express.json());
+// Explicitly enable preflight across-the-board
+app.options('*', cors());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
+
+// Global request logger
+app.use((req, res, next) => {
+  const startTimeNs = process.hrtime.bigint();
+  const { method, originalUrl } = req;
+  console.log(`[REQ] ${method} ${originalUrl}`);
+  res.on('finish', () => {
+    const durationMs = Number((process.hrtime.bigint() - startTimeNs) / 1000000n);
+    console.log(`[RES] ${method} ${originalUrl} -> ${res.statusCode} (${durationMs}ms)`);
+  });
+  next();
+});
+
+// Unified error logger to always include message and stack
+const logError = (context, err) => {
+  const message = err && err.message ? err.message : String(err);
+  const stack = err && err.stack ? err.stack : undefined;
+  if (stack) {
+    console.error(`[ERR] ${context} -> ${message}\n${stack}`);
+  } else {
+    console.error(`[ERR] ${context} -> ${message}`);
+  }
+};
 
 // Health check endpoint
 app.get('/', (req, res) => {
   res.json({ message: 'Server is running!' });
 });
+
+// Deterministic password encryption (AES-256-ECB) using ENCRYPTION_KEY
+const encryptPassword = (plain) => {
+  const rawKey = process.env.ENCRYPTION_KEY;
+  if (!rawKey) throw new Error('Missing ENCRYPTION_KEY');
+  const key = crypto.createHash('sha256').update(String(rawKey)).digest();
+  const cipher = crypto.createCipheriv('aes-256-ecb', key, null);
+  const encrypted = Buffer.concat([cipher.update(String(plain), 'utf8'), cipher.final()]);
+  return encrypted.toString('hex');
+};
+
+// Simple admin auth middleware
+const isAdmin = (req, res, next) => {
+  try {
+    const authHeader = req.get('authorization');
+    const bearer = authHeader && authHeader.startsWith('Bearer ')
+      ? authHeader.slice('Bearer '.length)
+      : undefined;
+
+    const tokenOk = process.env.ADMIN_TOKEN && bearer && bearer === process.env.ADMIN_TOKEN;
+
+    if (tokenOk) return next();
+    return res.status(401).json({ error: 'Unauthorized' });
+  } catch (err) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+};
+
+// Admin login endpoint (password only, returns static token from env)
+app.post('/admin/login', async (req, res) => {
+  try {
+    const { password } = req.body || {};
+    if (!password) {
+      return res.status(400).json({ error: 'Missing password' });
+    }
+
+    // Validate against Convex admin_credentials table
+    try {
+      const encrypted = encryptPassword(password);
+      const result = await convex.mutation('requests:adminLogin', { password: encrypted });
+      if (!result?.success) {
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
+    } catch (e) {
+      logError('Convex admin login', e);
+      return res.status(500).json({ error: 'Login failed' });
+    }
+
+    if (!process.env.ADMIN_TOKEN) {
+      return res.status(500).json({ error: 'Server misconfigured: missing ADMIN_TOKEN' });
+    }
+
+    // Return the configured token for subsequent Bearer auth
+    return res.json({ token: process.env.ADMIN_TOKEN, tokenType: 'Bearer' });
+  } catch (error) {
+    logError('Admin login handler', error);
+    return res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// Admin change password endpoint
+app.post('/admin/password', isAdmin, async (req, res) => {
+  try {
+    const { oldPassword, newPassword } = req.body || {};
+    if (!oldPassword || !newPassword) {
+      return res.status(400).json({ error: 'Missing oldPassword or newPassword' });
+    }
+
+    const oldEnc = encryptPassword(oldPassword);
+    const loginCheck = await convex.mutation('requests:adminLogin', { password: oldEnc });
+    if (!loginCheck?.success) {
+      return res.status(401).json({ error: 'Old password is incorrect' });
+    }
+
+    const newEnc = encryptPassword(newPassword);
+    const result = await convex.mutation('requests:setAdminPassword', {
+      oldPassword: oldEnc,
+      newPassword: newEnc,
+    });
+
+    if (!result?.success) {
+      return res.status(500).json({ error: 'Could not update password' });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    logError('Admin change password', error);
+    res.status(500).json({ error: 'Password change failed' });
+  }
+});
+
+// Super-admin: force password reset by providing encryption key in body
+app.post('/admin/password/force', async (req, res) => {
+  try {
+    const { encryptionKey, newPassword } = req.body || {};
+    if (!encryptionKey || !newPassword) {
+      return res.status(400).json({ error: 'Missing encryptionKey or newPassword' });
+    }
+
+    // Validate provided key matches env
+    if (!process.env.ENCRYPTION_KEY || encryptionKey !== process.env.ENCRYPTION_KEY) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const newEnc = encryptPassword(newPassword);
+    const result = await convex.mutation('requests:forceSetAdminPassword', { newPassword: newEnc });
+    if (!result?.success) {
+      return res.status(500).json({ error: 'Could not force update password' });
+    }
+    res.json({ success: true, ...result });
+  } catch (error) {
+    logError('Force password reset', error);
+    res.status(500).json({ error: 'Password reset failed' });
+  }
+});
+
+// Helper to map request docs with contact details
+const mapRequestsWithContacts = async (requests) => {
+  return Promise.all(
+    requests.map(async (reqDoc) => {
+      let contact = null;
+      try {
+        contact = await convex.query('contacts:getContact', { contactId: reqDoc.contactId });
+      } catch (_) {
+        // ignore
+      }
+      return {
+        id: reqDoc._id,
+        source: reqDoc.source,
+        status: reqDoc.status,
+        createdAt: new Date(reqDoc.requestedAt).toISOString(),
+        name: contact?.name,
+        email: contact?.email,
+        phone: contact?.phone,
+        // include onboarding-specific optional fields transparently
+        objective: reqDoc.objective,
+        experience: reqDoc.experience,
+        experienceLevel: reqDoc.experienceLevel,
+        speakingExperience: reqDoc.speakingExperience,
+        listeningExperience: reqDoc.listeningExperience,
+        readingExperience: reqDoc.readingExperience,
+        writingExperience: reqDoc.writingExperience,
+        comment: reqDoc.comment,
+        // new common metadata
+        isRead: !!reqDoc.isRead,
+        isFavorite: !!reqDoc.isFavorite,
+        note: reqDoc.note || "",
+      };
+    })
+  );
+};
+
+// Factory to create handlers for a given source type
+const createRequestsBySourceHandler = (source) => async (req, res) => {
+  try {
+    const requests = await convex.query('requests:getRequestsBySource', { source });
+    const enriched = await mapRequestsWithContacts(requests);
+    res.json({ requests: enriched });
+  } catch (error) {
+    logError(`Fetching ${source} requests`, error);
+    res.status(500).json({ error: `Error fetching ${source} requests`, details: error.message });
+  }
+};
+
+// Admin-only endpoints for listing requests by source
+app.get('/admin/interviews', isAdmin, createRequestsBySourceHandler('interview'));
+app.get('/admin/onboarding', isAdmin, createRequestsBySourceHandler('onboarding'));
+
+// Public aliases for interviews listings (no auth required)
+app.get('/interviews', createRequestsBySourceHandler('interview'));
+app.get('/interview/requests', createRequestsBySourceHandler('interview'));
+app.get('/interview/all', createRequestsBySourceHandler('interview'));
+
+// Public aliases for onboarding listings (no auth required)
+app.get('/onboarding/requests', createRequestsBySourceHandler('onboarding'));
+app.get('/onboardings', createRequestsBySourceHandler('onboarding'));
+app.get('/onboarding/all', createRequestsBySourceHandler('onboarding'));
 
 // Get all contacts endpoint
 app.get('/contacts', async (req, res) => {
@@ -44,7 +255,7 @@ app.get('/contacts', async (req, res) => {
     const contacts = await convex.query("contacts:getAllContacts");
     res.json({ contacts });
   } catch (error) {
-    console.error('Error fetching contacts:', error);
+    logError('Fetching contacts', error);
     res.status(500).json({ error: 'Error fetching contacts', details: error.message });
   }
 });
@@ -52,10 +263,46 @@ app.get('/contacts', async (req, res) => {
 // Get all requests endpoint
 app.get('/requests', async (req, res) => {
   try {
+    const {
+      page,
+      pageSize,
+      startDate,
+      endDate,
+      favoritesOnly,
+      unreadOnly,
+    } = req.query || {};
+
+    if (
+      page !== undefined ||
+      pageSize !== undefined ||
+      startDate !== undefined ||
+      endDate !== undefined ||
+      favoritesOnly !== undefined ||
+      unreadOnly !== undefined
+    ) {
+      const result = await convex.query('requests:getRequestsFilteredPaged', {
+        page: Number(page || 1),
+        pageSize: Number(pageSize || 20),
+        startDate: startDate ? Number(startDate) : undefined,
+        endDate: endDate ? Number(endDate) : undefined,
+        favoritesOnly: favoritesOnly === 'true' ? true : favoritesOnly === 'false' ? false : undefined,
+        unreadOnly: unreadOnly === 'true' ? true : unreadOnly === 'false' ? false : undefined,
+      });
+      const enriched = await mapRequestsWithContacts(result.items || []);
+      return res.json({
+        page: result.page,
+        pageSize: result.pageSize,
+        total: result.total,
+        totalPages: result.totalPages,
+        requests: enriched,
+      });
+    }
+
     const requests = await convex.query("requests:getAllRequests");
-    res.json({ requests });
+    const enriched = await mapRequestsWithContacts(requests);
+    res.json({ requests: enriched });
   } catch (error) {
-    console.error('Error fetching requests:', error);
+    logError('Fetching requests', error);
     res.status(500).json({ error: 'Error fetching requests', details: error.message });
   }
 });
@@ -69,10 +316,95 @@ app.get('/requests/status/:status', async (req, res) => {
     }
 
     const requests = await convex.query("requests:getRequestsByStatus", { status });
-    res.json({ requests });
+    const enriched = await mapRequestsWithContacts(requests);
+    res.json({ requests: enriched });
   } catch (error) {
-    console.error('Error fetching requests by status:', error);
+    logError('Fetching requests by status', error);
     res.status(500).json({ error: 'Error fetching requests by status', details: error.message });
+  }
+});
+
+// Admin-only: mark as read
+app.post('/requests/:id/read', isAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await convex.mutation('requests:markRequestRead', { requestId: id });
+    res.json({ success: true });
+  } catch (error) {
+    logError('Mark request read', error);
+    res.status(500).json({ success: false });
+  }
+});
+
+// Admin-only: mark as unread
+app.post('/requests/:id/unread', isAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await convex.mutation('requests:markRequestUnread', { requestId: id });
+    res.json({ success: true });
+  } catch (error) {
+    logError('Mark request unread', error);
+    res.status(500).json({ success: false });
+  }
+});
+
+// Admin-only: set note
+app.post('/requests/:id/note', isAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { note } = req.body || {};
+    await convex.mutation('requests:setRequestNote', { requestId: id, note: note || '' });
+    res.json({ success: true });
+  } catch (error) {
+    logError('Set request note', error);
+    res.status(500).json({ success: false });
+  }
+});
+
+// Admin-only: favorite
+app.post('/requests/:id/favorite', isAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await convex.mutation('requests:markRequestFavorite', { requestId: id });
+    res.json({ success: true });
+  } catch (error) {
+    logError('Favorite request', error);
+    res.status(500).json({ success: false });
+  }
+});
+
+// Admin-only: unfavorite
+app.post('/requests/:id/unfavorite', isAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await convex.mutation('requests:unmarkRequestFavorite', { requestId: id });
+    res.json({ success: true });
+  } catch (error) {
+    logError('Unfavorite request', error);
+    res.status(500).json({ success: false });
+  }
+});
+
+// Admin-only: mark all as read
+app.post('/requests/all/read', isAdmin, async (req, res) => {
+  try {
+    const result = await convex.mutation('requests:markAllRequestsRead', {});
+    res.json(result);
+  } catch (error) {
+    logError('Mark all requests read', error);
+    res.status(500).json({ success: false });
+  }
+});
+
+// Admin-only: delete a request
+app.delete('/requests/:id', isAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await convex.mutation('requests:deleteRequest', { requestId: id });
+    res.json(result);
+  } catch (error) {
+    logError('Delete request', error);
+    res.status(500).json({ success: false });
   }
 });
 
@@ -228,7 +560,7 @@ app.post('/onboarding', async (req, res) => {
     res.json({ success: true });
 
   } catch (error) {
-    console.error('Email error:', error);
+    logError('Onboarding email', error);
     res.status(500).json({ success: false });
   }
 });
@@ -354,7 +686,7 @@ app.post('/interview', async (req, res) => {
     res.json({ success: true });
 
   } catch (error) {
-    console.error('Interview email error:', error);
+    logError('Interview email', error);
     res.status(500).json({ success: false });
   }
 });
@@ -377,7 +709,7 @@ app.post('/newsletter/subscribe', async (req, res) => {
 
     res.json({ success: true });
   } catch (error) {
-    console.error('Error subscribing to newsletter:', error);
+    logError('Newsletter subscribe', error);
     res.status(500).json({ success: false });
   }
 });
@@ -399,7 +731,324 @@ app.post('/newsletter/unsubscribe', async (req, res) => {
 
     res.json({ success: true });
   } catch (error) {
-    console.error('Error unsubscribing from newsletter:', error);
+    logError('Newsletter unsubscribe', error);
+    res.status(500).json({ success: false });
+  }
+});
+
+// Multimedia list endpoint (public)
+app.get('/multimedia', async (req, res) => {
+  try {
+    const items = await convex.query('multimedia:getAllMultimedia');
+    res.json({ items });
+  } catch (error) {
+    logError('List multimedia', error);
+    res.status(500).json({ error: 'Error fetching multimedia', details: error.message });
+  }
+});
+
+// Multimedia upload (admin): accepts base64, uploads to Supabase, records in Convex
+app.post('/multimedia', isAdmin, async (req, res) => {
+  try {
+    const { kind, mimeType, filename, base64, data: dataStr, title, alt, campaignId, bucket: bucketOverride } = req.body || {};
+    console.log('[UPLOAD] received', {
+      kind,
+      mimeType,
+      hasFilename: !!filename,
+      base64Chars: typeof base64 === 'string' ? base64.length : 0,
+      dataChars: typeof dataStr === 'string' ? dataStr.length : 0,
+      supabaseConfigured: !!supabase,
+      supabaseUrlSet: !!SUPABASE_URL,
+      hasServiceRole: !!SUPABASE_SERVICE_ROLE,
+    });
+    if (!kind || !mimeType || !filename) {
+      return res.status(400).json({ error: 'Missing required fields: kind, mimeType' });
+    }
+    if (!supabase) {
+      console.error('[UPLOAD] Supabase not configured', { SUPABASE_URL: !!SUPABASE_URL, SUPABASE_SERVICE_ROLE: !!SUPABASE_SERVICE_ROLE });
+      return res.status(500).json({ error: 'Supabase is not configured (missing SUPABASE_URL or SUPABASE_SERVICE_ROLE)' });
+    }
+    // Accept either `base64` or `data` as a Base64 string (optionally a data URL)
+    const rawB64 = (typeof base64 === 'string' && base64.length)
+      ? base64
+      : (typeof dataStr === 'string' && dataStr.length)
+      ? dataStr
+      : null;
+    if (!rawB64) {
+      return res.status(400).json({ error: 'Missing base64 data: provide `base64` or `data` string' });
+    }
+    const commaIdx = rawB64.indexOf(',');
+    const base64Body = commaIdx >= 0 ? rawB64.slice(commaIdx + 1) : rawB64;
+    const buf = Buffer.from(base64Body, 'base64');
+    const bucket = bucketOverride || process.env.SUPABASE_BUCKET || 'assets';
+    // Use a dated path for organization
+    const y = new Date().getUTCFullYear();
+    const m = String(new Date().getUTCMonth() + 1).padStart(2, '0');
+    const d = String(new Date().getUTCDate()).padStart(2, '0');
+    const unique = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    const path = `${y}/${m}/${d}/${unique}-${filename}`;
+    console.log('[UPLOAD] target', { bucket, path, size: buf.byteLength });
+
+    const { error: uploadErr } = await supabase.storage.from(bucket).upload(path, buf, {
+      contentType: mimeType,
+      upsert: false,
+    });
+    if (uploadErr) {
+      console.error('[UPLOAD] supabase upload error', { name: uploadErr.name, message: uploadErr.message, statusCode: uploadErr.statusCode });
+      throw uploadErr;
+    }
+
+    const id = await convex.mutation('multimedia:createRecord', {
+      kind,
+      mimeType,
+      filename,
+      size: buf.byteLength,
+      storageProvider: 'supabase',
+      supabaseBucket: bucket,
+      supabasePath: path,
+      title,
+      alt,
+      campaignId,
+    });
+    res.json({ success: true, id, bucket, path });
+  } catch (error) {
+    logError('Upload multimedia', error);
+    res.status(500).json({ success: false, error: error?.message || 'Upload failed' });
+  }
+});
+
+// Admin: check Supabase configuration and bucket existence
+app.get('/admin/supabase/health', isAdmin, async (req, res) => {
+  try {
+    const bucket = req.query.bucket || process.env.SUPABASE_BUCKET || 'assets';
+    const isConfigured = !!supabase;
+    if (!isConfigured) return res.json({ isConfigured, bucket, exists: false });
+    const { data: buckets, error } = await supabase.storage.listBuckets();
+    if (error) throw error;
+    const exists = Array.isArray(buckets) && buckets.some((b) => b.name === bucket);
+    res.json({ isConfigured, bucket, exists });
+  } catch (error) {
+    logError('Supabase health', error);
+    res.status(500).json({ error: error?.message || 'Health check failed' });
+  }
+});
+
+// Admin: create a Supabase bucket if missing
+app.post('/admin/supabase/buckets/:bucket', isAdmin, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    const { bucket } = req.params;
+    const { public: isPublic } = req.body || {};
+    const { error } = await supabase.storage.createBucket(bucket, { public: !!isPublic });
+    if (error) throw error;
+    res.json({ success: true, bucket, public: !!isPublic });
+  } catch (error) {
+    logError('Create bucket', error);
+    res.status(500).json({ success: false, error: error?.message || 'Create bucket failed' });
+  }
+});
+
+// Link multimedia to campaign (admin)
+app.post('/multimedia/:id/link', isAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { campaignId } = req.body || {};
+    if (!campaignId) return res.status(400).json({ error: 'Missing campaignId' });
+    const result = await convex.mutation('multimedia:linkToCampaign', { multimediaId: id, campaignId });
+    res.json(result);
+  } catch (error) {
+    logError('Link multimedia', error);
+    res.status(500).json({ success: false });
+  }
+});
+
+// Unlink multimedia (admin)
+app.post('/multimedia/:id/unlink', isAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await convex.mutation('multimedia:unlinkFromCampaign', { multimediaId: id });
+    res.json(result);
+  } catch (error) {
+    logError('Unlink multimedia', error);
+    res.status(500).json({ success: false });
+  }
+});
+
+// Delete if orphan (admin) — also deletes from Supabase if applicable
+app.delete('/multimedia/:id', isAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    // Fetch record to know where it's stored
+    const doc = await convex.query('multimedia:getById', { multimediaId: id });
+    if (!doc) return res.json({ success: true, deleted: false });
+    if (doc.status !== 'orphan') return res.json({ success: false, reason: 'not_orphan' });
+
+    // Delete from provider first
+    if (doc.storageProvider === 'supabase' && supabase && doc.supabaseBucket && doc.supabasePath) {
+      await supabase.storage.from(doc.supabaseBucket).remove([doc.supabasePath]);
+    }
+
+    const result = await convex.mutation('multimedia:deleteIfOrphan', { multimediaId: id });
+    res.json(result);
+  } catch (error) {
+    logError('Delete multimedia', error);
+    res.status(500).json({ success: false });
+  }
+});
+
+// Get multimedia metadata
+app.get('/multimedia/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const doc = await convex.query('multimedia:getById', { multimediaId: id });
+    if (!doc) return res.status(404).json({ error: 'Not found' });
+    res.json({ multimedia: doc });
+  } catch (error) {
+    logError('Get multimedia', error);
+    res.status(500).json({ error: 'Error fetching multimedia', details: error.message });
+  }
+});
+
+// Get a temporary URL for the asset (Supabase signed URL if stored there)
+app.get('/multimedia/:id/url', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const doc = await convex.query('multimedia:getById', { multimediaId: id });
+    if (!doc) return res.status(404).json({ error: 'Not found' });
+
+    if (doc.storageProvider === 'supabase' && supabase && doc.supabaseBucket && doc.supabasePath) {
+      const expiresIn = Number(process.env.SUPABASE_SIGNED_URL_TTL_SEC || 60 * 10); // default 10m
+      const { data, error: urlErr } = await supabase
+        .storage
+        .from(doc.supabaseBucket)
+        .createSignedUrl(doc.supabasePath, expiresIn);
+      if (urlErr) throw urlErr;
+      return res.json({ url: data?.signedUrl || null, mimeType: doc.mimeType });
+    }
+
+    // Fallback to Convex storage (legacy)
+    const result = await convex.query('multimedia:getUrl', { multimediaId: id });
+    if (!result) return res.status(404).json({ error: 'Not found' });
+    res.json(result);
+  } catch (error) {
+    logError('Get multimedia url', error);
+    res.status(500).json({ error: 'Error generating URL', details: error.message });
+  }
+});
+
+// Courses: list with optional filters
+app.get('/courses', async (req, res) => {
+  try {
+    const { minLevel, startDateFrom, startDateTo, text } = req.query || {};
+    const result = await convex.query('courses:findCourses', {
+      minLevel: typeof minLevel === 'string' && minLevel.length ? minLevel : undefined,
+      startDateFrom: startDateFrom ? Number(startDateFrom) : undefined,
+      startDateTo: startDateTo ? Number(startDateTo) : undefined,
+      textSearch: typeof text === 'string' && text.length ? text : undefined,
+    });
+    res.json({ courses: result });
+  } catch (error) {
+    logError('List courses', error);
+    res.status(500).json({ error: 'Error fetching courses', details: error.message });
+  }
+});
+
+// Courses: get one
+app.get('/courses/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const course = await convex.query('courses:getCourse', { courseId: id });
+    if (!course) return res.status(404).json({ error: 'Not found' });
+    res.json({ course });
+  } catch (error) {
+    logError('Get course', error);
+    res.status(500).json({ error: 'Error fetching course', details: error.message });
+  }
+});
+
+// Courses: create (admin)
+app.post('/courses', isAdmin, async (req, res) => {
+  try {
+    const {
+      title,
+      image,
+      description,
+      startDate,
+      textColor,
+      minLevel,
+      specialNotes,
+      attachments,
+      links,
+    } = req.body || {};
+
+    if (!title || !image || !textColor || !minLevel) {
+      return res.status(400).json({ error: 'Missing required fields: title, image, textColor, minLevel' });
+    }
+
+    const courseId = await convex.mutation('courses:addCourse', {
+      title,
+      image,
+      description,
+      startDate: startDate !== undefined && startDate !== null ? Number(startDate) : undefined,
+      textColor,
+      minLevel,
+      specialNotes,
+      attachments,
+      links,
+    });
+    res.json({ success: true, id: courseId });
+  } catch (error) {
+    logError('Create course', error);
+    res.status(500).json({ success: false });
+  }
+});
+
+// Courses: update (admin)
+app.put('/courses/:id', isAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      title,
+      image,
+      description,
+      startDate,
+      textColor,
+      minLevel,
+      specialNotes,
+      attachments,
+      links,
+    } = req.body || {};
+
+    const payload = {
+      courseId: id,
+      title,
+      image,
+      description,
+      // allow clearing with null
+      startDate: startDate === null ? null : startDate !== undefined ? Number(startDate) : undefined,
+      textColor,
+      minLevel,
+      specialNotes: specialNotes === null ? null : specialNotes,
+      attachments: attachments === null ? null : attachments,
+      links: links === null ? null : links,
+    };
+
+    const result = await convex.mutation('courses:updateCourse', payload);
+    res.json(result);
+  } catch (error) {
+    logError('Update course', error);
+    res.status(500).json({ success: false });
+  }
+});
+
+// Courses: delete (admin)
+app.delete('/courses/:id', isAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await convex.mutation('courses:deleteCourse', { courseId: id });
+    res.json(result);
+  } catch (error) {
+    logError('Delete course', error);
     res.status(500).json({ success: false });
   }
 });
@@ -423,7 +1072,7 @@ app.get('/newsletter/subscription/:email', async (req, res) => {
       subscription
     });
   } catch (error) {
-    console.error('Error getting subscription status:', error);
+    logError('Get newsletter subscription', error);
     res.status(500).json({ error: 'Error getting subscription status', details: error.message });
   }
 });
@@ -434,9 +1083,19 @@ app.get('/newsletter/subscribers', async (req, res) => {
     const subscribers = await convex.query("newsletter:getAllActiveSubscriptions");
     res.json({ subscribers });
   } catch (error) {
-    console.error('Error fetching newsletter subscribers:', error);
+    logError('Fetch newsletter subscribers', error);
     res.status(500).json({ error: 'Error fetching newsletter subscribers', details: error.message });
   }
+});
+
+// Centralized error handler (must be after all routes)
+app.use((err, req, res, next) => {
+  try {
+    const { method, originalUrl } = req || {};
+    logError(`${method || 'UNKNOWN'} ${originalUrl || ''}`, err);
+  } catch (_) {}
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: 'Internal Server Error' });
 });
 
 // Start server
@@ -452,4 +1111,28 @@ app.listen(PORT, () => {
   console.log(`Contacts endpoint: GET http://localhost:${PORT}/contacts`);
   console.log(`Requests endpoint: GET http://localhost:${PORT}/requests`);
   console.log(`Requests by status: GET http://localhost:${PORT}/requests/status/{pending|processed}`);
+  console.log(`Mark request read: POST http://localhost:${PORT}/requests/{id}/read`);
+  console.log(`Mark request unread: POST http://localhost:${PORT}/requests/{id}/unread`);
+  console.log(`Set request note: POST http://localhost:${PORT}/requests/{id}/note`);
+  console.log(`Favorite request: POST http://localhost:${PORT}/requests/{id}/favorite`);
+  console.log(`Unfavorite request: POST http://localhost:${PORT}/requests/{id}/unfavorite`);
+  console.log(`Mark all requests read: POST http://localhost:${PORT}/requests/all/read`);
+  console.log(`Delete request: DELETE http://localhost:${PORT}/requests/{id}`);
+  console.log(`Interview requests (admin): GET http://localhost:${PORT}/admin/interviews`);
+  console.log(`Onboarding requests (admin): GET http://localhost:${PORT}/admin/onboarding`);
+  console.log(`Interview requests (public): GET http://localhost:${PORT}/interviews | /interview/requests | /interview/all`);
+  console.log(`Onboarding requests (public): GET http://localhost:${PORT}/onboarding/requests | /onboardings | /onboarding/all`);
+  console.log(`Admin login: POST http://localhost:${PORT}/admin/login`);
+  console.log(`Courses list: GET http://localhost:${PORT}/courses`);
+  console.log(`Courses get: GET http://localhost:${PORT}/courses/{id}`);
+  console.log(`Courses create (admin): POST http://localhost:${PORT}/courses`);
+  console.log(`Courses update (admin): PUT http://localhost:${PORT}/courses/{id}`);
+  console.log(`Courses delete (admin): DELETE http://localhost:${PORT}/courses/{id}`);
+  console.log(`Multimedia list: GET http://localhost:${PORT}/multimedia`);
+  console.log(`Multimedia upload (admin): POST http://localhost:${PORT}/multimedia`);
+  console.log(`Multimedia link (admin): POST http://localhost:${PORT}/multimedia/{id}/link`);
+  console.log(`Multimedia unlink (admin): POST http://localhost:${PORT}/multimedia/{id}/unlink`);
+  console.log(`Multimedia delete-if-orphan (admin): DELETE http://localhost:${PORT}/multimedia/{id}`);
+  console.log(`Multimedia get: GET http://localhost:${PORT}/multimedia/{id}`);
+  console.log(`Multimedia get URL: GET http://localhost:${PORT}/multimedia/{id}/url`);
 });
