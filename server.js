@@ -32,6 +32,7 @@ const transporter = nodemailer.createTransport({
 app.use(cors({
   origin: [
     'https://the-english-crab-app.vercel.app',
+    'https://the-english-crab-app-federicopedraza-federico-pedrazas-projects.vercel.app',
     'https://the-english-crab-app-git-main-federico-pedrazas-projects.vercel.app',
     'http://localhost:5173'
   ],
