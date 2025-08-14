@@ -58,26 +58,32 @@ export default defineSchema({
   // Courses catalog
   courses: defineTable({
     title: v.string(),
-    image: v.string(),
+    image: v.optional(v.string()),
     description: v.optional(v.string()),
-    startDate: v.optional(v.number()), // ms since epoch
-    textColor: v.string(),
-    minLevel: v.string(),
-    specialNotes: v.optional(v.string()),
+    startDate: v.optional(v.union(v.number(), v.null())), // ms since epoch
+    textColor: v.optional(v.string()),
+    minLevel: v.optional(v.string()),
+    specialNotes: v.optional(v.union(v.string(), v.null())),
     attachments: v.optional(
-      v.array(
-        v.object({
-          label: v.string(),
-          url: v.string(),
-        })
+      v.union(
+        v.array(
+          v.object({
+            label: v.string(),
+            url: v.string(),
+          })
+        ),
+        v.null()
       )
     ),
     links: v.optional(
-      v.array(
-        v.object({
-          label: v.string(),
-          url: v.string(),
-        })
+      v.union(
+        v.array(
+          v.object({
+            label: v.string(),
+            url: v.string(),
+          })
+        ),
+        v.null()
       )
     ),
     createdAt: v.number(),
@@ -87,6 +93,37 @@ export default defineSchema({
     .index("by_min_level", ["minLevel"]) 
     .index("by_start_date", ["startDate"]) 
     .index("by_created_at", ["createdAt"]),
+
+  // Course thumbnail configurations
+  course_thumbnails: defineTable({
+    courseId: v.id("courses"),
+    customTexts: v.array(
+      v.object({
+        id: v.string(),
+        text: v.string(),
+        left: v.number(),
+        top: v.number(),
+        fontSize: v.optional(v.number()),
+        color: v.optional(v.string()),
+        fontFamily: v.optional(v.string()),
+        fontWeight: v.optional(v.string()),
+        textAlign: v.optional(
+          v.union(v.literal("left"), v.literal("center"), v.literal("right"))
+        ),
+      })
+    ),
+    imagePosition: v.optional(
+      v.object({
+        x: v.number(),
+        y: v.number(),
+      })
+    ),
+    imageScale: v.optional(v.number()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_course", ["courseId"]) 
+    .index("by_updated_at", ["updatedAt"]),
 
   // Multimedia assets (images/files stored in Convex storage)
   multimedia: defineTable({
@@ -101,15 +138,15 @@ export default defineSchema({
     // Supabase storage info (when storageProvider === 'supabase')
     supabaseBucket: v.optional(v.string()),
     supabasePath: v.optional(v.string()),
-    // Optional link to a campaign that might be created later (generic string to allow pre-creation)
-    campaignId: v.optional(v.string()),
+    // Optional link to a course this asset belongs to
+    courseId: v.optional(v.id("courses")),
     status: v.union(v.literal("orphan"), v.literal("linked")),
     title: v.optional(v.string()),
     alt: v.optional(v.string()),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
-    .index("by_campaign", ["campaignId"]) 
+    .index("by_course", ["courseId"]) 
     .index("by_status", ["status"]) 
     .index("by_created_at", ["createdAt"]),
 });

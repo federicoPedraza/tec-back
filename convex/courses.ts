@@ -1,5 +1,6 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
+import { api } from "./_generated/api";
 
 // Common object validators reused in args
 const attachmentValidator = v.object({ label: v.string(), url: v.string() });
@@ -8,11 +9,11 @@ const linkValidator = v.object({ label: v.string(), url: v.string() });
 export const addCourse = mutation({
   args: {
     title: v.string(),
-    image: v.string(),
+    image: v.optional(v.string()),
     description: v.optional(v.string()),
-    startDate: v.optional(v.number()),
-    textColor: v.string(),
-    minLevel: v.string(),
+    startDate: v.optional(v.union(v.number(), v.null())),
+    textColor: v.optional(v.string()),
+    minLevel: v.optional(v.string()),
     specialNotes: v.optional(v.string()),
     attachments: v.optional(v.array(attachmentValidator)),
     links: v.optional(v.array(linkValidator)),
@@ -123,6 +124,72 @@ export const findCourses = query({
     }
 
     return results;
+  },
+});
+
+// ----------------------
+// Course thumbnails
+// ----------------------
+
+const courseThumbnailText = v.object({
+  id: v.string(),
+  text: v.string(),
+  left: v.number(),
+  top: v.number(),
+  fontSize: v.optional(v.number()),
+  color: v.optional(v.string()),
+  fontFamily: v.optional(v.string()),
+  fontWeight: v.optional(v.string()),
+  textAlign: v.optional(v.union(v.literal("left"), v.literal("center"), v.literal("right"))),
+});
+
+export const getCourseThumbnail = query({
+  args: { courseId: v.id("courses") },
+  handler: async (ctx, args) => {
+    const existing = await ctx.db
+      .query("course_thumbnails")
+      .withIndex("by_course", (q) => q.eq("courseId", args.courseId))
+      .order("desc")
+      .first();
+    return existing || null;
+  },
+});
+
+export const upsertCourseThumbnail = mutation({
+  args: {
+    courseId: v.id("courses"),
+    customTexts: v.array(courseThumbnailText),
+    imagePosition: v.optional(v.object({ x: v.number(), y: v.number() })),
+    imageScale: v.optional(v.number()),
+    updatedAt: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const now = Date.now();
+    const existing = await ctx.db
+      .query("course_thumbnails")
+      .withIndex("by_course", (q) => q.eq("courseId", args.courseId))
+      .order("desc")
+      .first();
+
+    if (existing) {
+      await ctx.db.patch(existing._id, {
+        customTexts: args.customTexts,
+        imagePosition: args.imagePosition,
+        imageScale: args.imageScale,
+        updatedAt: args.updatedAt ?? now,
+      });
+      return { success: true, id: existing._id };
+    }
+
+    const id = await ctx.db.insert("course_thumbnails", {
+      courseId: args.courseId,
+      customTexts: args.customTexts,
+      imagePosition: args.imagePosition,
+      imageScale: args.imageScale,
+      createdAt: now,
+      updatedAt: args.updatedAt ?? now,
+    });
+    return { success: true, id };
   },
 });
 

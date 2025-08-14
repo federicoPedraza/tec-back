@@ -19,6 +19,78 @@ const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE)
   : null;
 
+// Sanitize filenames: remove spaces, diacritics, and unsafe URL characters
+const sanitizeFilename = (name) => {
+  try {
+    if (!name || typeof name !== 'string') return 'file';
+    const noPath = String(name).split('/').pop().split('\\').pop();
+    const trimmed = noPath.trim();
+    const dotIndex = trimmed.lastIndexOf('.');
+    const base = dotIndex > 0 ? trimmed.slice(0, dotIndex) : trimmed;
+    const ext = dotIndex > 0 ? trimmed.slice(dotIndex + 1) : '';
+
+    const normalizedBase = base.normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
+    let safe = normalizedBase
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, '-') // replace unsafe chars with '-'
+      .replace(/-+/g, '-') // collapse multiple '-'
+      .replace(/^[\-.]+|[\-.]+$/g, ''); // trim leading/trailing '.' or '-'
+    if (!safe) safe = 'file';
+
+    const safeExt = ext
+      ? ext
+          .normalize('NFKD')
+          .replace(/[\u0300-\u036f]/g, '')
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '')
+      : '';
+
+    return safeExt ? `${safe}.${safeExt}` : safe;
+  } catch (_) {
+    return 'file';
+  }
+};
+
+// Helper: resolve a multimedia URL for a given image identifier (course-aware fallback)
+const getCourseImageUrl = async (image, courseId) => {
+  try {
+    if (typeof image === 'string' && (image.startsWith('http://') || image.startsWith('https://'))) {
+      return image;
+    }
+    if (typeof image === 'string' && image.length) {
+      const doc = await convex.query('multimedia:getById', { multimediaId: image });
+      if (doc) {
+        if (doc.storageProvider === 'supabase' && supabase && doc.supabaseBucket && doc.supabasePath) {
+          const expiresIn = Number(process.env.SUPABASE_SIGNED_URL_TTL_SEC || 60 * 10);
+          const { data, error } = await supabase.storage.from(doc.supabaseBucket).createSignedUrl(doc.supabasePath, expiresIn);
+          if (!error) return data?.signedUrl || null;
+        } else {
+          const result = await convex.query('multimedia:getUrl', { multimediaId: image });
+          if (result?.url) return result.url;
+        }
+      }
+    }
+    // Fallback: if courseId provided, try latest image linked to the course
+    if (courseId) {
+      const assets = await convex.query('multimedia:getCourseImages', { courseId });
+      if (Array.isArray(assets) && assets.length) {
+        const latest = assets.reduce((a, b) => (a.updatedAt > b.updatedAt ? a : b));
+        if (latest.storageProvider === 'supabase' && supabase && latest.supabaseBucket && latest.supabasePath) {
+          const expiresIn = Number(process.env.SUPABASE_SIGNED_URL_TTL_SEC || 60 * 10);
+          const { data, error } = await supabase.storage.from(latest.supabaseBucket).createSignedUrl(latest.supabasePath, expiresIn);
+          if (!error) return data?.signedUrl || null;
+        } else if (latest._id) {
+          const res = await convex.query('multimedia:getUrl', { multimediaId: latest._id });
+          if (res?.url) return res.url;
+        }
+      }
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
+};
+
 // Create nodemailer transporter
 const transporter = nodemailer.createTransport({
   service: 'gmail',
@@ -751,7 +823,7 @@ app.get('/multimedia', async (req, res) => {
 // Multimedia upload (admin): accepts base64, uploads to Supabase, records in Convex
 app.post('/multimedia', isAdmin, async (req, res) => {
   try {
-    const { kind, mimeType, filename, base64, data: dataStr, title, alt, campaignId, bucket: bucketOverride } = req.body || {};
+    const { kind, mimeType, filename, base64, data: dataStr, title, alt, courseId, bucket: bucketOverride } = req.body || {};
     console.log('[UPLOAD] received', {
       kind,
       mimeType,
@@ -787,7 +859,8 @@ app.post('/multimedia', isAdmin, async (req, res) => {
     const m = String(new Date().getUTCMonth() + 1).padStart(2, '0');
     const d = String(new Date().getUTCDate()).padStart(2, '0');
     const unique = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-    const path = `${y}/${m}/${d}/${unique}-${filename}`;
+    const safeFilename = sanitizeFilename(filename || 'file');
+    const path = `${y}/${m}/${d}/${unique}-${safeFilename}`;
     console.log('[UPLOAD] target', { bucket, path, size: buf.byteLength });
 
     const { error: uploadErr } = await supabase.storage.from(bucket).upload(path, buf, {
@@ -809,7 +882,7 @@ app.post('/multimedia', isAdmin, async (req, res) => {
       supabasePath: path,
       title,
       alt,
-      campaignId,
+      courseId,
     });
     res.json({ success: true, id, bucket, path });
   } catch (error) {
@@ -849,13 +922,13 @@ app.post('/admin/supabase/buckets/:bucket', isAdmin, async (req, res) => {
   }
 });
 
-// Link multimedia to campaign (admin)
+// Link multimedia to course (admin)
 app.post('/multimedia/:id/link', isAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const { campaignId } = req.body || {};
-    if (!campaignId) return res.status(400).json({ error: 'Missing campaignId' });
-    const result = await convex.mutation('multimedia:linkToCampaign', { multimediaId: id, campaignId });
+    const { courseId } = req.body || {};
+    if (!courseId) return res.status(400).json({ error: 'Missing courseId' });
+    const result = await convex.mutation('multimedia:linkToCourse', { multimediaId: id, courseId });
     res.json(result);
   } catch (error) {
     logError('Link multimedia', error);
@@ -863,11 +936,11 @@ app.post('/multimedia/:id/link', isAdmin, async (req, res) => {
   }
 });
 
-// Unlink multimedia (admin)
+// Unlink multimedia from course (admin)
 app.post('/multimedia/:id/unlink', isAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const result = await convex.mutation('multimedia:unlinkFromCampaign', { multimediaId: id });
+    const result = await convex.mutation('multimedia:unlinkFromCourse', { multimediaId: id });
     res.json(result);
   } catch (error) {
     logError('Unlink multimedia', error);
@@ -947,7 +1020,13 @@ app.get('/courses', async (req, res) => {
       startDateTo: startDateTo ? Number(startDateTo) : undefined,
       textSearch: typeof text === 'string' && text.length ? text : undefined,
     });
-    res.json({ courses: result });
+    const courses = await Promise.all(
+      (Array.isArray(result) ? result : []).map(async (c) => ({
+        ...c,
+        imageUrl: await getCourseImageUrl(c?.image, c?._id),
+      }))
+    );
+    res.json({ courses });
   } catch (error) {
     logError('List courses', error);
     res.status(500).json({ error: 'Error fetching courses', details: error.message });
@@ -960,7 +1039,8 @@ app.get('/courses/:id', async (req, res) => {
     const { id } = req.params;
     const course = await convex.query('courses:getCourse', { courseId: id });
     if (!course) return res.status(404).json({ error: 'Not found' });
-    res.json({ course });
+    const imageUrl = await getCourseImageUrl(course?.image, course?._id);
+    res.json({ course: { ...course, imageUrl } });
   } catch (error) {
     logError('Get course', error);
     res.status(500).json({ error: 'Error fetching course', details: error.message });
@@ -982,22 +1062,26 @@ app.post('/courses', isAdmin, async (req, res) => {
       links,
     } = req.body || {};
 
-    if (!title || !image || !textColor || !minLevel) {
-      return res.status(400).json({ error: 'Missing required fields: title, image, textColor, minLevel' });
+    // Only require title
+    if (!title || (typeof title !== 'string') || !title.trim()) {
+      return res.status(400).json({ error: 'Missing required field: title' });
     }
 
     const courseId = await convex.mutation('courses:addCourse', {
       title,
       image,
       description,
-      startDate: startDate !== undefined && startDate !== null ? Number(startDate) : undefined,
+      startDate: startDate === null ? null : (startDate !== undefined ? Number(startDate) : undefined),
       textColor,
       minLevel,
-      specialNotes,
-      attachments,
-      links,
+      // Normalize nullable optionals to undefined/arrays per Convex validators
+      specialNotes: typeof specialNotes === 'string' ? specialNotes : undefined,
+      attachments: Array.isArray(attachments) ? attachments : undefined,
+      links: Array.isArray(links) ? links : undefined,
     });
-    res.json({ success: true, id: courseId });
+    // Return created course with imageUrl for convenience
+    const imageUrl = await getCourseImageUrl(image, courseId);
+    res.json({ success: true, id: courseId, imageUrl });
   } catch (error) {
     logError('Create course', error);
     res.status(500).json({ success: false });
@@ -1035,9 +1119,49 @@ app.put('/courses/:id', isAdmin, async (req, res) => {
     };
 
     const result = await convex.mutation('courses:updateCourse', payload);
-    res.json(result);
+    // If successful, include resolved image URL based on the latest course doc
+    let imageUrl = null;
+    try {
+      const updated = await convex.query('courses:getCourse', { courseId: id });
+      imageUrl = await getCourseImageUrl(updated?.image, updated?._id);
+    } catch (_) {}
+    res.json({ ...result, imageUrl });
   } catch (error) {
     logError('Update course', error);
+    res.status(500).json({ success: false });
+  }
+});
+
+// Courses: partial update (admin)
+app.patch('/courses/:id', isAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const body = req.body || {};
+
+    const payload = { courseId: id };
+
+    if (Object.prototype.hasOwnProperty.call(body, 'title')) payload.title = body.title;
+    if (Object.prototype.hasOwnProperty.call(body, 'image')) payload.image = body.image;
+    if (Object.prototype.hasOwnProperty.call(body, 'description')) payload.description = body.description;
+    if (Object.prototype.hasOwnProperty.call(body, 'startDate')) payload.startDate = body.startDate === null ? null : Number(body.startDate);
+    if (Object.prototype.hasOwnProperty.call(body, 'textColor')) payload.textColor = body.textColor;
+    if (Object.prototype.hasOwnProperty.call(body, 'minLevel')) payload.minLevel = body.minLevel;
+    if (Object.prototype.hasOwnProperty.call(body, 'specialNotes')) payload.specialNotes = body.specialNotes === null ? null : body.specialNotes;
+    if (Object.prototype.hasOwnProperty.call(body, 'attachments')) payload.attachments = body.attachments === null ? null : body.attachments;
+    if (Object.prototype.hasOwnProperty.call(body, 'links')) payload.links = body.links === null ? null : body.links;
+
+    const result = await convex.mutation('courses:updateCourse', payload);
+
+    // Return updated course imageUrl for convenience
+    let imageUrl = null;
+    try {
+      const updated = await convex.query('courses:getCourse', { courseId: id });
+      imageUrl = await getCourseImageUrl(updated?.image, updated?._id);
+    } catch (_) {}
+
+    res.json({ ...result, imageUrl });
+  } catch (error) {
+    logError('Patch course', error);
     res.status(500).json({ success: false });
   }
 });
@@ -1051,6 +1175,120 @@ app.delete('/courses/:id', isAdmin, async (req, res) => {
   } catch (error) {
     logError('Delete course', error);
     res.status(500).json({ success: false });
+  }
+});
+
+// Courses: thumbnails — GET current config (public)
+app.get('/courses/:id/thumbnail', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const cfg = await convex.query('courses:getCourseThumbnail', { courseId: id });
+    return res.json({ thumbnail: cfg || null });
+  } catch (error) {
+    logError('Get course thumbnail', error);
+    res.status(500).json({ error: 'Error fetching course thumbnail', details: error.message });
+  }
+});
+
+// Alias for thumbnail GET
+app.get('/courses/:id/thumbnail-config', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const cfg = await convex.query('courses:getCourseThumbnail', { courseId: id });
+    return res.json({ thumbnail: cfg || null });
+  } catch (error) {
+    logError('Get course thumbnail-config', error);
+    res.status(500).json({ error: 'Error fetching course thumbnail', details: error.message });
+  }
+});
+
+// Alternate path using course id — responds with { data }
+app.get('/course-thumbnails/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const cfg = await convex.query('courses:getCourseThumbnail', { courseId: id });
+    return res.json({ data: cfg || null });
+  } catch (error) {
+    logError('Get course-thumbnails by course id', error);
+    res.status(500).json({ error: 'Error fetching course thumbnail', details: error.message });
+  }
+});
+
+// Courses: thumbnails — UPSERT config (admin)
+const normalizeThumbnailPayload = (raw) => {
+  const body = raw || {};
+  const source = body.thumbnail && typeof body.thumbnail === 'object' ? body.thumbnail : body;
+  const normalized = {
+    customTexts: Array.isArray(source.customTexts) ? source.customTexts : [],
+    imagePosition: source.imagePosition,
+    imageScale: source.imageScale,
+    updatedAt: typeof source.updatedAt === 'number' ? source.updatedAt : undefined,
+  };
+  return normalized;
+};
+
+app.put('/courses/:id/thumbnail', isAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { customTexts, imagePosition, imageScale, updatedAt } = normalizeThumbnailPayload(req.body);
+    if (!Array.isArray(customTexts)) {
+      return res.status(400).json({ error: 'customTexts must be an array' });
+    }
+    const result = await convex.mutation('courses:upsertCourseThumbnail', {
+      courseId: id,
+      customTexts,
+      imagePosition,
+      imageScale,
+      updatedAt,
+    });
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    logError('Upsert course thumbnail', error);
+    res.status(500).json({ success: false, error: 'Error saving course thumbnail', details: error.message });
+  }
+});
+
+// Alias for UPSERT via PUT
+app.put('/courses/:id/thumbnail-config', isAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { customTexts, imagePosition, imageScale, updatedAt } = normalizeThumbnailPayload(req.body);
+    if (!Array.isArray(customTexts)) {
+      return res.status(400).json({ error: 'customTexts must be an array' });
+    }
+    const result = await convex.mutation('courses:upsertCourseThumbnail', {
+      courseId: id,
+      customTexts,
+      imagePosition,
+      imageScale,
+      updatedAt,
+    });
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    logError('Upsert course thumbnail-config', error);
+    res.status(500).json({ success: false, error: 'Error saving course thumbnail', details: error.message });
+  }
+});
+
+// Alternate path: POST to /course-thumbnails/:id (admin)
+app.post('/course-thumbnails/:id', isAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { customTexts, imagePosition, imageScale, updatedAt } = normalizeThumbnailPayload(req.body);
+    if (!Array.isArray(customTexts)) {
+      return res.status(400).json({ error: 'customTexts must be an array' });
+    }
+    const result = await convex.mutation('courses:upsertCourseThumbnail', {
+      courseId: id,
+      customTexts,
+      imagePosition,
+      imageScale,
+      updatedAt,
+    });
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    logError('Post course thumbnail-config', error);
+    res.status(500).json({ success: false, error: 'Error saving course thumbnail', details: error.message });
   }
 });
 
@@ -1129,6 +1367,12 @@ app.listen(PORT, () => {
   console.log(`Courses create (admin): POST http://localhost:${PORT}/courses`);
   console.log(`Courses update (admin): PUT http://localhost:${PORT}/courses/{id}`);
   console.log(`Courses delete (admin): DELETE http://localhost:${PORT}/courses/{id}`);
+  console.log(`Course thumbnail get: GET http://localhost:${PORT}/courses/{id}/thumbnail`);
+  console.log(`Course thumbnail get (alias): GET http://localhost:${PORT}/courses/{id}/thumbnail-config`);
+  console.log(`Course thumbnail get (alt path): GET http://localhost:${PORT}/course-thumbnails/{id}`);
+  console.log(`Course thumbnail save (admin): PUT http://localhost:${PORT}/courses/{id}/thumbnail`);
+  console.log(`Course thumbnail save (admin alias): PUT http://localhost:${PORT}/courses/{id}/thumbnail-config`);
+  console.log(`Course thumbnail save (admin alt): POST http://localhost:${PORT}/course-thumbnails/{id}`);
   console.log(`Multimedia list: GET http://localhost:${PORT}/multimedia`);
   console.log(`Multimedia upload (admin): POST http://localhost:${PORT}/multimedia`);
   console.log(`Multimedia link (admin): POST http://localhost:${PORT}/multimedia/{id}/link`);

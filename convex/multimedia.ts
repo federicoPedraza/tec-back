@@ -17,8 +17,8 @@ export const createRecord = mutation({
     supabasePath: v.optional(v.string()),
     title: v.optional(v.string()),
     alt: v.optional(v.string()),
-    // Optional pre-link to a campaign (string ID that might not exist yet)
-    campaignId: v.optional(v.string()),
+    // Optional link to a course
+    courseId: v.optional(v.id("courses")),
   },
   handler: async (ctx, args) => {
     const now = Date.now();
@@ -32,8 +32,8 @@ export const createRecord = mutation({
       storageId: args.storageId,
       supabaseBucket: args.supabaseBucket,
       supabasePath: args.supabasePath,
-      campaignId: args.campaignId,
-      status: args.campaignId ? "linked" : "orphan",
+      courseId: args.courseId,
+      status: args.courseId ? "linked" : "orphan",
       title: args.title,
       alt: args.alt,
       createdAt: now,
@@ -44,14 +44,14 @@ export const createRecord = mutation({
   },
 });
 
-export const linkToCampaign = mutation({
+export const linkToCourse = mutation({
   args: {
     multimediaId: v.id("multimedia"),
-    campaignId: v.string(),
+    courseId: v.id("courses"),
   },
   handler: async (ctx, args) => {
     await ctx.db.patch(args.multimediaId, {
-      campaignId: args.campaignId,
+      courseId: args.courseId,
       status: "linked",
       updatedAt: Date.now(),
     });
@@ -59,13 +59,13 @@ export const linkToCampaign = mutation({
   },
 });
 
-export const unlinkFromCampaign = mutation({
+export const unlinkFromCourse = mutation({
   args: {
     multimediaId: v.id("multimedia"),
   },
   handler: async (ctx, args) => {
     await ctx.db.patch(args.multimediaId, {
-      campaignId: undefined,
+      courseId: undefined,
       status: "orphan",
       updatedAt: Date.now(),
     } as any);
@@ -124,6 +124,16 @@ export const getAllMultimedia = query({
       .order("desc")
       .collect();
     return items;
+  },
+});
+
+export const getCourseImages = query({
+  args: { courseId: v.id("courses") },
+  handler: async (ctx, args) => {
+    return await ctx.db
+      .query("multimedia")
+      .withIndex("by_course", (q) => q.eq("courseId", args.courseId))
+      .collect();
   },
 });
 

@@ -1,5 +1,12 @@
 {
   "version": 2,
+  "builds": [
+    {
+      "src": "server.js",
+      "use": "@vercel/node"
+    }
+  ],
+  "buildCommand": "convex deploy -y",
   "routes": [
     {
       "src": "/(.*)",
