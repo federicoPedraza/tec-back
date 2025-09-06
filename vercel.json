@@ -6,7 +6,7 @@
       "use": "@vercel/node"
     }
   ],
-  "buildCommand": "convex deploy -y",
+  "buildCommand": "npm run build",
   "routes": [
     {
       "src": "/(.*)",
