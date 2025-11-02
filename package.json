@@ -9,13 +9,11 @@
     "build": "convex deploy -y"
   },
   "dependencies": {
-    "connect-redis": "^9.0.0",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^4.18.2",
-    "express-session": "^1.18.2",
-    "nodemailer": "^6.9.7",
-    "redis": "^5.8.2"
+    "jsonwebtoken": "^9.0.2",
+    "nodemailer": "^6.9.7"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
