@@ -2,6 +2,7 @@
   "name": "tec-back",
   "version": "1.0.0",
   "description": "Backend server with Nodemailer email integration",
+  "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

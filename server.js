@@ -11,6 +11,8 @@ const PORT = process.env.PORT || 3000;
 
 // Middleware
 const allowedOrigins = [
+  'https://www.theenglishcrab.com',
+  'https://theenglishcrab.com',
   'https://the-english-crab-app.vercel.app',
   'https://fresh-louse-regularly.ngrok-free.app',
   'http://localhost:5173'
