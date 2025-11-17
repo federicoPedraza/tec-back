@@ -42,10 +42,27 @@ const loadTemplate = (filename, variables = {}) => {
 };
 
 // CORS headers helper
-const setCorsHeaders = (res) => {
-  res.setHeader("Access-Control-Allow-Origin", "https://www.theenglishcrab.com");
+const setCorsHeaders = (req, res) => {
+  const allowedOrigins = [
+    'https://www.theenglishcrab.com',
+    'https://theenglishcrab.com',
+    'https://the-english-crab-app.vercel.app',
+    'http://localhost:5173',
+    'http://localhost:3000',
+    'http://127.0.0.1:5173',
+    'http://127.0.0.1:3000'
+  ];
+  
+  const origin = req.headers.origin;
+  if (origin && allowedOrigins.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  } else {
+    res.setHeader("Access-Control-Allow-Origin", "https://www.theenglishcrab.com");
+  }
+  
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Credentials", "true");
 };
 
 export {

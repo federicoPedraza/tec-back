@@ -84,8 +84,39 @@ app.get('/', (req, res) => {
   res.json({ message: 'Server is running!' });
 });
 
+// API routes - proxy to Vercel function handlers for local development
+app.all('/api/generate-token', async (req, res) => {
+  try {
+    const handler = (await import('./api/generate-token.js')).default;
+    return handler(req, res);
+  } catch (error) {
+    logError('Load generate-token handler', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+app.all('/api/onboarding', async (req, res) => {
+  try {
+    const handler = (await import('./api/onboarding.js')).default;
+    return handler(req, res);
+  } catch (error) {
+    logError('Load onboarding handler', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+app.all('/api/interview', async (req, res) => {
+  try {
+    const handler = (await import('./api/interview.js')).default;
+    return handler(req, res);
+  } catch (error) {
+    logError('Load interview handler', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
 // JWT token generation endpoint
-app.post('/api/generate-token', (req, res) => {
+app.post('/generate-token', (req, res) => {
   try {
     const { payload, expiresIn } = req.body;
     
@@ -121,7 +152,7 @@ app.post('/api/generate-token', (req, res) => {
 });
 
 // Onboarding endpoint (emails only)
-app.post('/api/onboarding', async (req, res) => {
+app.post('/onboarding', async (req, res) => {
   try {
     const {
       name,
@@ -212,7 +243,7 @@ app.post('/api/onboarding', async (req, res) => {
 });
 
 // Interview endpoint (emails only)
-app.post('/api/interview', async (req, res) => {
+app.post('/interview', async (req, res) => {
   try {
     const {
       name,
@@ -340,7 +371,10 @@ app.use((err, req, res, next) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server is running on port ${PORT}`);
   console.log(`🏥 Health check: http://localhost:${PORT}`);
-  console.log(`📧 Onboarding endpoint: POST http://localhost:${PORT}/api/onboarding`);
-  console.log(`🎤 Interview endpoint: POST http://localhost:${PORT}/api/interview`);
-  console.log(`🔑 JWT generation endpoint: POST http://localhost:${PORT}/api/generate-token`);
+  console.log(`📧 Onboarding endpoint: POST http://localhost:${PORT}/onboarding`);
+  console.log(`📧 API Onboarding endpoint: POST http://localhost:${PORT}/api/onboarding`);
+  console.log(`🎤 Interview endpoint: POST http://localhost:${PORT}/interview`);
+  console.log(`🎤 API Interview endpoint: POST http://localhost:${PORT}/api/interview`);
+  console.log(`🔑 JWT generation endpoint: POST http://localhost:${PORT}/generate-token`);
+  console.log(`🔑 API JWT generation endpoint: POST http://localhost:${PORT}/api/generate-token`);
 });

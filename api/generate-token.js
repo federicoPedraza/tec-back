@@ -2,7 +2,7 @@ import jwt from 'jsonwebtoken';
 import { setCorsHeaders, logError } from './utils.js';
 
 export default function handler(req, res) {
-  setCorsHeaders(res);
+  setCorsHeaders(req, res);
 
   if (req.method === "OPTIONS") {
     return res.status(200).end();
