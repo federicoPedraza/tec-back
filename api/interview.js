@@ -111,10 +111,15 @@ export default async function handler(req, res) {
       userResult = null;
     }
 
-    const adminResult = await transporter.sendMail(adminMailOptions);
+    // Only send admin email if not in local environment
+    // If IS_LOCAL is not present in .env, emails will be sent (assuming it's not local)
+    let adminResult = null;
+    if (process.env.IS_LOCAL !== 'true') {
+      adminResult = await transporter.sendMail(adminMailOptions);
+    }
 
     console.log('✅ Interview request emails sent successfully:', {
-      admin: adminResult.messageId,
+      admin: adminResult?.messageId || (process.env.IS_LOCAL === 'true' ? 'Skipped (IS_LOCAL=true)' : 'Failed'),
       user: userResult?.messageId || 'No user email provided'
     });
 
