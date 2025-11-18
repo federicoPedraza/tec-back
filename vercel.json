@@ -1,5 +1,7 @@
 {
   "version": 2,
+  "buildCommand": "echo 'Building serverless functions...'",
+  "outputDirectory": "public",
   "env": {
     "NODE_ENV": "production"
   }
