@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node server.cjs",
     "dev": "nodemon server.cjs",
-    "build": "convex deploy -y"
+    "build": "echo 'No build step needed for Vercel serverless functions'",
+    "deploy:convex": "convex deploy -y"
   },
   "dependencies": {
     "cors": "^2.8.5",
