@@ -107,7 +107,8 @@ export default async function handler(req, res) {
         `,
       };
 
-      userResult = await transporter.sendMail(userMailOptions);
+      // userResult = await transporter.sendMail(userMailOptions); // Commented out - not sending email to client for now
+      userResult = null;
     }
 
     const adminResult = await transporter.sendMail(adminMailOptions);

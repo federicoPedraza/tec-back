@@ -83,14 +83,13 @@ export default async function handler(req, res) {
       })
     };
 
-    const [adminResult, userResult] = await Promise.all([
-      transporter.sendMail(adminMailOptions),
-      transporter.sendMail(userMailOptions)
-    ]);
+    const adminResult = await transporter.sendMail(adminMailOptions);
+    // const userResult = await transporter.sendMail(userMailOptions); // Commented out - not sending email to client for now
+    const userResult = null;
 
     console.log('✅ Emails sent successfully:', {
       admin: adminResult.messageId,
-      user: userResult.messageId
+      user: userResult?.messageId || 'Not sent (commented out)'
     });
 
     res.json({ success: true });
