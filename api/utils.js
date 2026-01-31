@@ -45,6 +45,8 @@ const loadTemplate = (filename, variables = {}) => {
 const setCorsHeaders = (req, res) => {
   const allowedOrigins = [
     'https://www.theenglishcrab.com',
+    'https://www.dev.theenglishcrab.com',
+    'https://dev.theenglishcrab.com',
     'https://theenglishcrab.com',
     'https://the-english-crab-app.vercel.app',
     'http://localhost:5173',
